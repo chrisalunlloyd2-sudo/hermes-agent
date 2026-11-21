@@ -217,6 +217,11 @@ _SPECS = [
              help="Initial card status. Use 'blocked' for cards "
                   "that require immediate human ops (R3 gate) "
                   "to skip the brief running-to-blocked transition."),
+        _arg("--read-only", action="store_true",
+             help="Mark the card read-only (audit/doc/board-hygiene work): it "
+                  "runs in the read-only lane capped by "
+                  "kanban.max_in_progress_read_only and may run concurrently "
+                  "with other read-only cards instead of the heavy worker pool."),
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
     _cmd("swarm", [

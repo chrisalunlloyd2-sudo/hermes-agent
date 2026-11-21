@@ -59,8 +59,8 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
     # Honour kanban.default_assignee, kanban.max_in_progress,
-    # kanban.max_in_progress_per_profile and kanban.max_spawn with the same
-    # semantics as the gateway dispatch path.
+    # kanban.max_in_progress_per_profile, kanban.max_in_progress_read_only and
+    # kanban.max_spawn with the same semantics as the gateway dispatch path.
     try:
         from hermes_cli.config import load_config
         _cfg = load_config()
@@ -73,6 +73,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress = kbd.resolve_max_in_progress(
             kbd._positive_int(_kanban_cfg.get("max_in_progress"), None)
         )
+        # UNIFY-3 auditors' lane: positive kanban.max_in_progress_read_only lets
+        # cards flagged read_only run concurrently with the heavy pool; unset →
+        # lane disabled (legacy single-pool behaviour).
+        max_in_progress_read_only = kbd.configured_max_in_progress_read_only()
         # CLI --max is the more explicit signal, so it wins over kanban.max_spawn.
         cli_max = getattr(args, "max", None)
         max_spawn = (
@@ -80,6 +84,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     except Exception:
         default_assignee = max_in_progress_per_profile = max_in_progress = None
+        max_in_progress_read_only = None
         max_spawn = getattr(args, "max", None)
     with kbc.connect_closing() as conn:
         res = kbd.dispatch_once(
@@ -90,6 +95,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            max_in_progress_read_only=max_in_progress_read_only,
         )
     if getattr(args, "json", False):
         _print_json({

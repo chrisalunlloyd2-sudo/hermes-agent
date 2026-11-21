@@ -886,6 +886,11 @@ _LATER_TASK_COLUMNS = (
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # Read-only lane flag (UNIFY-3): 0/NULL = heavy (write) lane, competes for
+    # ``kanban.max_in_progress``; 1 = read-only lane capped by
+    # ``kanban.max_in_progress_read_only`` (auditors run concurrently). Defaults
+    # reproduce pre-lane behaviour exactly.
+    ("read_only", "read_only INTEGER NOT NULL DEFAULT 0"),
 )
 
 _NOTIFY_SUB_COLUMNS = (

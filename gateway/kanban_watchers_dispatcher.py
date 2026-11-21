@@ -41,6 +41,10 @@ class _DispatcherSettings:
     reconcile_orphans: bool
     default_assignee: Optional[str]
     max_in_progress_per_profile: Optional[int]
+    # UNIFY-3 read-only lane: caps cards flagged read_only (auditors) so they
+    # may run concurrently with the heavy pool. None = lane disabled
+    # (legacy single-pool behaviour).
+    max_in_progress_read_only: Optional[int]
 
 
 def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
@@ -114,6 +118,12 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         # Per-profile concurrency cap: no single profile's local model / API
         # quota / browser pool gets overwhelmed by a fan-out.
         max_in_progress_per_profile=_positive_int_setting(kanban_cfg, "max_in_progress_per_profile"),
+        # UNIFY-3 auditors' lane: positive kanban.max_in_progress_read_only lets
+        # cards flagged read_only run concurrently with each other up to this
+        # cap, on top of the heavy pool. Unset/invalid → lane disabled.
+        max_in_progress_read_only=_positive_int_setting(
+            kanban_cfg, "max_in_progress_read_only"
+        ),
     )
 
 

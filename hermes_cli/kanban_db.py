@@ -638,6 +638,11 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    # Read-only lane flag (UNIFY-3). 1 = card is safe to run concurrently with
+    # other read-only cards (audit/doc/board-hygiene work); 0/False (legacy
+    # default) = heavy lane, competes for the ``max_in_progress`` pool exactly
+    # as before.
+    read_only: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Task:
@@ -656,6 +661,7 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            read_only=bool(g("read_only")),
         )
 
 
@@ -874,7 +880,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Read-only lane flag (UNIFY-3). Cards marked read_only (audits, doc
+    -- reads, board hygiene) may run CONCURRENTLY with each other up to
+    -- ``kanban.max_in_progress_read_only`` because they do not touch
+    -- repos or spawn builds; heavy (write) tasks keep the strict
+    -- ``kanban.max_in_progress`` pool. NULL/0 = heavy lane (default, so
+    -- every pre-existing row keeps exactly its previous behaviour).
+    read_only            INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1168,6 +1181,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    read_only: bool = False,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1267,8 +1281,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        read_only
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1278,6 +1293,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        1 if read_only else 0,
                     ),
                 )
                 for pid in parents:
@@ -1298,6 +1314,7 @@ def create_task(
                         "project_id": project_id,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
+                        "read_only": bool(read_only) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
                     },

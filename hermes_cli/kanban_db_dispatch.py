@@ -1990,6 +1990,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    max_in_progress_read_only: Optional[int] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
@@ -2013,6 +2014,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            max_in_progress_read_only=max_in_progress_read_only,
             reconcile_orphans=reconcile_orphans,
         )
 
@@ -2047,6 +2049,27 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
     except (TypeError, ValueError):
         return spawn_fn(task, workspace)
+
+
+def configured_max_in_progress_read_only() -> Optional[int]:
+    """Read ``kanban.max_in_progress_read_only`` from config, or None.
+
+    Returns the value only when it is a positive integer — anything else
+    means "lane disabled" and every dispatch entry point keeps the legacy
+    single-pool semantics (UNIFY-3 additive behaviour).
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get("max_in_progress_read_only")
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return val if val > 0 else None
 
 
 def _dispatch_lane_task(
@@ -2208,14 +2231,24 @@ def _tick_spawn_budget(
     max_spawn: Optional[int],
     max_in_progress: Optional[int],
     board: Optional[str],
-) -> tuple[bool, Optional[int]]:
-    """``(may_spawn, spawn_budget)`` for this tick; ``budget None`` = uncapped.
+    max_in_progress_read_only: Optional[int] = None,
+) -> tuple[bool, Optional[int], Optional[int], Optional[int]]:
+    """``(may_spawn, spawn_budget, heavy_left, ro_left)`` for this tick.
 
     ``max_spawn`` is a live per-board concurrency cap (running + this tick's
     spawns), not a per-tick budget — a per-tick reading would grow concurrency
     by N every tick. ``max_in_progress`` is a HOST-level cap: running workers on
     every other board count against the same budget, else N boards multiply the
     cap by N — exactly the fan-out the memory-derived default exists to prevent.
+
+    UNIFY-3 read-only lane: when ``max_in_progress_read_only`` is set (>0),
+    cards flagged ``read_only`` draw from their own lane budget (``ro_left``)
+    instead of the heavy pool, and a saturated heavy pool no longer
+    early-returns the whole tick — auditors keep flowing under their own cap.
+    The cap being unset keeps the exact legacy single-pool semantics (including
+    the saturation early-return); ``heavy_left``/``ro_left`` are ``None``
+    whenever their lane is disabled and the caller falls back to the folded
+    ``spawn_budget``.
     """
     # Count already-running tasks so max_spawn enforces concurrency, not a
     # per-tick budget: "running" tasks stay running until the worker makes a terminal
@@ -2228,16 +2261,38 @@ def _tick_spawn_budget(
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
-            return False, None
+            return False, None, None, None
         spawn_budget = max_spawn - running_count
 
+    # Both ready and review loops consume from the same budget.
+    ro_lane_enabled = (
+        isinstance(max_in_progress_read_only, int) and max_in_progress_read_only > 0
+    )
+    heavy_left: Optional[int] = None
+    ro_left: Optional[int] = None
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
-        if total_running >= max_in_progress:
-            return False, None
-        remaining = max_in_progress - total_running
-        if spawn_budget is None or spawn_budget > remaining:
-            spawn_budget = remaining
+        if total_running >= max_in_progress and not ro_lane_enabled:
+            # Legacy path: pool saturated, no read-only lane to drain → skip
+            # the entire tick exactly as pre-UNIFY-3 (review dispatch included).
+            return False, None, None, None
+        if not ro_lane_enabled:
+            # Legacy single-pool semantics: every running task counts, and the
+            # remaining capacity folds into the shared spawn budget.
+            remaining = max_in_progress - total_running
+            if spawn_budget is None or spawn_budget > remaining:
+                spawn_budget = remaining
+        else:
+            # Lane enabled: the heavy pool becomes a per-lane counter instead
+            # of a folded budget, so heavy saturation no longer blocks the
+            # read-only lane (which carries its own cap below).
+            heavy_left = max(max_in_progress - total_running, 0)
+    if ro_lane_enabled:
+        ro_running = conn.execute(
+            "SELECT COUNT(*) FROM tasks "
+            "WHERE status = 'running' AND COALESCE(read_only, 0) = 1"
+        ).fetchone()[0]
+        ro_left = max(max_in_progress_read_only - int(ro_running), 0)
 
     # Memory-pressure guard: a static cap can't see the host's actual state.
     # critical -> spawn nothing this tick; elevated -> at most one new worker.
@@ -2250,7 +2305,7 @@ def _tick_spawn_budget(
             "kanban dispatch: system memory pressure is critical; "
             "spawning no new workers this tick (deferred, not dropped)"
         )
-        return False, None
+        return False, spawn_budget, heavy_left, ro_left
     if pressure == "elevated":
         result.memory_pressure = pressure
         if spawn_budget is None or spawn_budget > 1:
@@ -2259,15 +2314,28 @@ def _tick_spawn_budget(
                 "limiting to at most 1 new worker this tick"
             )
             spawn_budget = 1
-    return True, spawn_budget
+    return True, spawn_budget, heavy_left, ro_left
 
 
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
-    """Unclaimed rows of one lane in dispatch order."""
+    """Unclaimed rows of one lane in dispatch order.
+
+    UNIFY-3 ordering: each ready card carries its ``read_only`` lane flag and
+    its "unblocker" weight (how many still-open children it would release if
+    finished). Ordering is unblockers-first (descending), then priority DESC,
+    then age ASC — the same order the single-lane path used, just with the
+    unblocker weight ahead of manual priority so a DAG bottleneck never
+    starves behind a pile of equally-priorited leaf cards.
+    """
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
-        f"WHERE status = '{status}' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+        "SELECT t.id, t.assignee, t.read_only, "
+        "      (SELECT COUNT(*) FROM task_links l "
+        "        JOIN tasks c ON c.id = l.child_id "
+        "       WHERE l.parent_id = t.id "
+        "         AND c.status NOT IN ('done', 'archived')) AS waiting "
+        "FROM tasks t "
+        f"WHERE t.status = '{status}' AND t.claim_lock IS NULL "
+        "ORDER BY waiting DESC, t.priority DESC, t.created_at ASC"
     ).fetchall()
 
 
@@ -2334,6 +2402,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    max_in_progress_read_only: Optional[int] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
@@ -2346,8 +2415,9 @@ def _dispatch_once_locked(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
     )
-    may_spawn, spawn_budget = _tick_spawn_budget(
+    may_spawn, spawn_budget, heavy_left, ro_left = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
+        max_in_progress_read_only=max_in_progress_read_only,
     )
     if not may_spawn:
         return result
@@ -2396,6 +2466,21 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
+        # UNIFY-3 lane admission: draw spawn budget from the card's own
+        # lane only. Read-only cards never consume heavy budget and vice
+        # versa, so an auditor can run while the heavy pool is saturated
+        # (bounded by the per-lane caps; lane-disabled → single pool).
+        _row_is_ro = bool(row["read_only"]) if "read_only" in row.keys() else False
+        if _row_is_ro and ro_left is not None:
+            if ro_left <= 0:
+                continue
+        elif heavy_left is not None:
+            if heavy_left <= 0:
+                # Lane disabled folded the heavy cap into spawn_budget, so
+                # this branch only fires when the RO lane is enabled while
+                # the heavy pool is saturated: heavy cards wait, auditors
+                # keep flowing.
+                continue
         row_assignee = row["assignee"]
         if not row_assignee:
             row_assignee = _kbda.fill_default_assignee(conn, row["id"], default_assignee, result, dry_run=dry_run)
@@ -2403,6 +2488,13 @@ def _dispatch_once_locked(
                 continue
         if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
             spawned += 1
+            # UNIFY-3: draw down the card's lane budget so later rows in
+            # this tick respect the per-lane caps. Subsequent ticks
+            # re-query the running counts from the DB.
+            if _row_is_ro and ro_left is not None:
+                ro_left -= 1
+            elif heavy_left is not None:
+                heavy_left -= 1
 
     # A review agent (sdlc-review) approves (→ done) or requests changes
     # (→ ready/todo). Review spawns share max_spawn with ready tasks. The loop
@@ -2414,8 +2506,15 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
+        _review_is_ro = bool(row["read_only"]) if "read_only" in row.keys() else False
         if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):
             spawned += 1
+            # UNIFY-3: review spawns draw from the same lane budgets so a
+            # review card cannot double-book a lane already at its cap.
+            if _review_is_ro and ro_left is not None:
+                ro_left -= 1
+            elif heavy_left is not None:
+                heavy_left -= 1
     return result
 
 
@@ -2880,11 +2979,13 @@ def run_daemon(
             # Re-resolved every tick (config load is mtime-cached) so operator
             # edits apply without a restart.
             max_in_progress = resolve_max_in_progress(configured_max_in_progress())
+            max_in_progress_read_only = configured_max_in_progress_read_only()
             with contextlib.closing(_kbc.connect()) as conn:
                 res = dispatch_once(
                     conn,
                     max_spawn=max_spawn,
                     max_in_progress=max_in_progress,
+                    max_in_progress_read_only=max_in_progress_read_only,
                     failure_limit=failure_limit,
                 )
             if on_tick is not None:
