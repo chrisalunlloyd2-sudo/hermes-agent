@@ -449,6 +449,40 @@ class InProcessCronScheduler(CronScheduler):
 
         logger.info("In-process cron scheduler started (interval=%ds)", interval)
 
+        # m007 H-07 (2026-11-23): measured 2026-11-22 incident — the cron tick was blind ~336 s
+        # during gateway warm-up (banner → first tick); operators learned never to restart in
+        # that window the hard way. Announce the first-tick ETA here and keep a one-line
+        # countdown running at 60 s intervals until the first tick actually FIRES; when a
+        # warm-up holds the tick past its ETA the lines read "overdue by" instead of going
+        # dark. Only-add: the pre-existing tick loop below is untouched.
+        _t_ticker_start = time.monotonic()
+        _first_tick_fired = threading.Event()
+
+        def _first_tick_countdown():
+            # 0.5 s wakeups so the "fired" line lands promptly; report lines stay pinned to
+            # the 60 s cadence the spec asks for.
+            _next_report = 60.0
+            while True:
+                if _first_tick_fired.wait(timeout=0.5):
+                    logger.info(
+                        "cron first tick fired %.1fs after ticker start (ETA was ~%ds)",
+                        time.monotonic() - _t_ticker_start, interval,
+                    )
+                    return
+                _elapsed = time.monotonic() - _t_ticker_start
+                if _elapsed < _next_report:
+                    continue
+                if _elapsed < interval:
+                    logger.info("cron first-tick countdown: %.0fs elapsed (ETA ~%ds)",
+                                _elapsed, interval)
+                else:
+                    logger.info("cron first tick overdue by %.0fs (ETA ~%ds) — warm-up holding it?",
+                                _elapsed - interval, interval)
+                _next_report += 60.0
+
+        threading.Thread(target=_first_tick_countdown, name="cron-first-tick-countdown",
+                         daemon=True).start()
+
         # Multiplex: tick EACH profile's store every cycle, heartbeats/recovery scoped per profile.
         # ── Multiplex profiles ──────────────────────────────────────────── When profile_homes is set
         # (multiplex_profiles on), tick EACH profile's cron store on every tick cycle so secondary-profile
@@ -527,6 +561,10 @@ class InProcessCronScheduler(CronScheduler):
             if ok:
                 _guarded_store_write(clear_ticker_error, "error clear")
                 consecutive_failures = 0
+            # m007 H-07 (2026-11-23): the countdown ends at the first CLEAN tick, not merely
+            # the first loop pass, so a blocked or failed first tick keeps counting down.
+            if ok and not _first_tick_fired.is_set():
+                _first_tick_fired.set()
             wait_for = _backoff_wait_seconds(interval, consecutive_failures)
             next_tick += wait_for
             now = time.monotonic()
